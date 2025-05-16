@@ -1,71 +1,44 @@
 import boto3
-import datetime
+from datetime import datetime, timedelta
 
-# Config
-MEMORY_NAMESPACE = 'CWAgent'
-MEMORY_METRIC_NAME = 'mem_used_percent'
-TIME_RANGE_MINUTES = 15
-OUTPUT_FILE_HAS_MEMORY = 'instances_with_memory_metrics.txt'
-OUTPUT_FILE_NO_MEMORY = 'instances_without_memory_metrics.txt'
+INSTANCE_ID = "i-08bd03bdecb4635ba"  # Replace with your test instance
 
-ec2 = boto3.client('ec2')
 cloudwatch = boto3.client('cloudwatch')
 
-def list_all_instance_ids():
-    instance_ids = []
-    paginator = ec2.get_paginator('describe_instances')
-    for page in paginator.paginate():
-        for reservation in page['Reservations']:
-            for instance in reservation['Instances']:
-                if instance['State']['Name'] == 'running':
-                    instance_ids.append(instance['InstanceId'])
-    return instance_ids
-
-def has_memory_metric(instance_id):
-    # List metrics for this instance and memory metric name
-    response = cloudwatch.list_metrics(
-        Namespace=MEMORY_NAMESPACE,
-        MetricName=MEMORY_METRIC_NAME,
-        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
-    )
-    return len(response['Metrics']) > 0
-
-def has_memory_data(instance_id):
-    end_time = datetime.datetime.utcnow()
-    start_time = end_time - datetime.timedelta(minutes=TIME_RANGE_MINUTES)
-
+def has_recent_datapoints(metric):
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=15)
     response = cloudwatch.get_metric_statistics(
-        Namespace=MEMORY_NAMESPACE,
-        MetricName=MEMORY_METRIC_NAME,
-        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+        Namespace=metric['Namespace'],
+        MetricName=metric['MetricName'],
+        Dimensions=metric['Dimensions'],
         StartTime=start_time,
         EndTime=end_time,
         Period=60,
         Statistics=['Average']
     )
-    datapoints = response.get('Datapoints', [])
-    return len(datapoints) > 0
+    return len(response['Datapoints']) > 0
 
-def main():
-    instance_ids = list_all_instance_ids()
-    print(f"Found {len(instance_ids)} running instances")
-
-    with open(OUTPUT_FILE_HAS_MEMORY, 'w') as f_has, open(OUTPUT_FILE_NO_MEMORY, 'w') as f_no:
-        for instance_id in instance_ids:
-            print(f"Checking instance {instance_id}... ", end="")
-            if has_memory_metric(instance_id):
-                # Metric exists, check if recent data available
-                if has_memory_data(instance_id):
-                    print("✅ Memory metric with data")
-                    f_has.write(instance_id + '\n')
-                else:
-                    print("❌ Memory metric but no recent data")
-                    f_no.write(instance_id + '\n')
+def check_instance_metrics(instance_id):
+    print(f"🔍 Checking memory-related metrics for instance: {instance_id}")
+    metrics = cloudwatch.list_metrics(Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}])
+    found = False
+    for m in metrics['Metrics']:
+        name = m['MetricName'].lower()
+        if 'mem' in name or 'memory' in name:
+            print(f"  📊 Found metric: {m['MetricName']} (Namespace: {m['Namespace']})")
+            if has_recent_datapoints(m):
+                print("    ✅ Receiving data.")
+                return True
             else:
-                print("❌ No memory metric")
-                f_no.write(instance_id + '\n')
+                print("    ❌ No recent data.")
+                found = True
+    if not found:
+        print("  ⚠️ No memory-related metrics found.")
+    return False
 
-    print(f"Check complete. Results saved to '{OUTPUT_FILE_HAS_MEMORY}' and '{OUTPUT_FILE_NO_MEMORY}'.")
-
-if __name__ == "__main__":
-    main()
+# Run the check
+if check_instance_metrics(INSTANCE_ID):
+    print("\n✅ Instance has working memory metrics.\n")
+else:
+    print("\n❌ Instance is missing memory metrics or no recent data.\n")
