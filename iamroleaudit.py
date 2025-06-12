@@ -3,8 +3,10 @@ import csv
 import boto3
 import botocore
 import io
+import json
 import sys
 import time
+import urllib.parse
 
 def get_account_id():
     sts = boto3.client('sts')
@@ -65,6 +67,40 @@ def get_latest_activity(user):
     else:
         return ""
 
+def get_trusted_entities(role):
+    """
+    Extracts and returns a comma-separated string of trusted entities
+    from an IAM role's AssumeRolePolicyDocument.
+    """
+    doc = role.get("AssumeRolePolicyDocument", {})
+    if isinstance(doc, str):
+        try:
+            # Sometimes the document might be URL-encoded.
+            decoded_doc = urllib.parse.unquote(doc)
+            doc = json.loads(decoded_doc)
+        except Exception:
+            try:
+                doc = json.loads(doc)
+            except Exception as e:
+                return f"Error parsing policy: {e}"
+    
+    principals = []
+    if 'Statement' in doc:
+        statements = doc['Statement']
+        if not isinstance(statements, list):
+            statements = [statements]
+        for stmt in statements:
+            principal = stmt.get("Principal", {})
+            if isinstance(principal, dict):
+                for k, v in principal.items():
+                    if isinstance(v, list):
+                        principals.extend(v)
+                    else:
+                        principals.append(v)
+            elif isinstance(principal, str):
+                principals.append(principal)
+    return ", ".join(principals)
+
 def main():
     output_filename = 'audit_report.csv'
     
@@ -73,7 +109,8 @@ def main():
     report_data = get_credential_report()
     user_report = parse_users(report_data)
     
-    header = ['Name', 'Account', 'Type', 'Use Type', 'Last Activity', 'MFA Active']
+    # Updated header includes Trusted Entities as the last column.
+    header = ['Name', 'Account', 'Type', 'Use Type', 'Last Activity', 'MFA Active', 'Trusted Entities']
     
     with open(output_filename, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
@@ -83,22 +120,25 @@ def main():
         for user in user_report:
             name = user['user']
             user_type = "User"
-            # Determine Use Type: "Console" if password is enabled; otherwise assume API.
+            # "Console" if password is enabled; otherwise assume API.
             use_type = "Console" if user['password_enabled'].lower() == 'true' else "API"
-            # Use our helper function to get the most recent activity.
             last_activity = get_latest_activity(user)
             mfa_active = user['mfa_active']
-            writer.writerow([name, account_id, user_type, use_type, last_activity, mfa_active])
+            # For users, Trusted Entities is not applicable.
+            trusted_entities = ""
+            writer.writerow([name, account_id, user_type, use_type, last_activity, mfa_active, trusted_entities])
         
         # Process IAM roles.
         for role in fetch_roles():
             name = role['RoleName']
             user_type = "Role"
             use_type = "AssumedRole"
-            # Roles do not have console or key activity.
+            # Roles do not have console activity.
             last_activity = ""
             mfa_active = "N/A"
-            writer.writerow([name, account_id, user_type, use_type, last_activity, mfa_active])
+            # Get trusted entities from the AssumeRolePolicyDocument.
+            trusted_entities = get_trusted_entities(role)
+            writer.writerow([name, account_id, user_type, use_type, last_activity, mfa_active, trusted_entities])
     
     print(f"CSV audit report generated: {output_filename}")
 
