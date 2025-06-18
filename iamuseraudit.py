@@ -1,12 +1,12 @@
 import boto3
-from tabulate import tabulate
+import csv
 
 def get_iam_details():
     """Retrieve read-only IAM details without modifications."""
     iam_client = boto3.client('iam')
     users_data = []
 
-    # Iterate through all IAM users using paginator to cover many users.
+    # Use paginator to go through all IAM users.
     paginator = iam_client.get_paginator('list_users')
     for page in paginator.paginate():
         for user in page['Users']:
@@ -24,7 +24,7 @@ def get_iam_details():
             inline_policies_resp = iam_client.list_user_policies(UserName=username)
             custom_policies = ', '.join(inline_policies_resp.get('PolicyNames', []))
 
-            # Retrieve access keys and details about last used info.
+            # Retrieve access keys and details about their last used information.
             access_keys_resp = iam_client.list_access_keys(UserName=username)
             access_keys_info = []
             for key in access_keys_resp.get('AccessKeyMetadata', []):
@@ -34,7 +34,7 @@ def get_iam_details():
                 service = last_used.get('ServiceName', 'N/A')
                 last_used_date = last_used.get('LastUsedDate', 'N/A')
                 access_keys_info.append(f"{key_id} (Last Used: {service} on {last_used_date})")
-            access_keys_str = "\n".join(access_keys_info)
+            access_keys_str = " | ".join(access_keys_info)
 
             # Append aggregated data for the user.
             users_data.append([
@@ -48,6 +48,13 @@ def get_iam_details():
 
 if __name__ == '__main__':
     iam_details = get_iam_details()
+    filename = 'iam_details.csv'
     headers = ["UserName", "Groups", "AWS Managed Policies", "Custom Policies", "Access Keys (Last Used)"]
-    table = tabulate(iam_details, headers=headers, tablefmt="grid")
-    print(table)
+
+    # Write details to CSV file.
+    with open(filename, mode='w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(headers)
+        writer.writerows(iam_details)
+
+    print(f"CSV file '{filename}' has been created with the IAM audit details.")
