@@ -1,87 +1,107 @@
 import boto3
+import time
 import csv
 from tabulate import tabulate
 from datetime import datetime
 
-# Initialize AWS clients
-ec2 = boto3.client("ec2")
-ssm = boto3.client("ssm")
+def list_instances():
+    ec2 = boto3.client("ec2")
+    response = ec2.describe_instances()
+    instances = []
+    for reservation in response.get("Reservations", []):
+        for instance in reservation.get("Instances", []):
+            name = "(no name)"
+            for tag in instance.get("Tags", []):
+                if tag["Key"] == "Name":
+                    name = tag["Value"]
+            instances.append({
+                "InstanceId": instance["InstanceId"],
+                "Name": name,
+                "State": instance["State"]["Name"]
+            })
+    return instances
 
-# Step 1: List all instances
-instances = ec2.describe_instances()
-instance_list = []
+def send_ssm_command(instance_id, command):
+    ssm = boto3.client("ssm")
+    response = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": [command]}
+    )
+    return response["Command"]["CommandId"]
 
-for reservation in instances["Reservations"]:
-    for instance in reservation["Instances"]:
-        instance_id = instance["InstanceId"]
-        name = ""
-        for tag in instance.get("Tags", []):
-            if tag["Key"] == "Name":
-                name = tag["Value"]
-        state = instance["State"]["Name"]
-        instance_list.append({
-            "id": instance_id,
-            "name": name if name else "(no name)",
-            "state": state
-        })
+def get_command_output(ssm, instance_id, command_id):
+    while True:
+        try:
+            output = ssm.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id
+            )
+            if output["Status"] in ("Success", "Failed", "Cancelled", "TimedOut"):
+                return output
+            else:
+                time.sleep(2)
+        except ssm.exceptions.InvocationDoesNotExist:
+            time.sleep(2)
 
-# Print instances with index
-print("\nAvailable Instances:")
-for idx, inst in enumerate(instance_list):
-    print(f"{idx}: {inst['name']} ({inst['id']}) - {inst['state']}")
+def main():
+    instances = list_instances()
+    if not instances:
+        print("No EC2 instances found.")
+        return
 
-# Select instance
-choice = int(input("\nSelect instance index: "))
-selected_instance = instance_list[choice]
-instance_id = selected_instance["id"]
+    # Show instances with index
+    print("\nAvailable Instances:")
+    for idx, inst in enumerate(instances):
+        print(f"[{idx}] {inst['Name']} ({inst['InstanceId']}) - {inst['State']}")
 
-print(f"\nFetching data from: {selected_instance['name']} ({instance_id})\n")
+    choice = int(input("\nSelect instance index: "))
+    if choice < 0 or choice >= len(instances):
+        print("Invalid choice.")
+        return
 
-# Step 2: Run SSM command to fetch users and tomcat dirs
-command_script = """
-#!/bin/bash
-users_list=$(ls -1 /home)
-for user in $users_list; do
-    tomcat_dirs=$(find /home/$user -maxdepth 1 -type d \\( -name "apache-tomcat*" -o -name "apache*" \\) 2>/dev/null | xargs -n 1 basename)
-    echo "$user,$tomcat_dirs"
-done
-"""
+    instance = instances[choice]
+    instance_id = instance["InstanceId"]
 
-response = ssm.send_command(
-    InstanceIds=[instance_id],
-    DocumentName="AWS-RunShellScript",
-    Parameters={"commands": [command_script]}
-)
+    # Bash script to list users and tomcat directories under /home
+    bash_script = """
+    for user in $(ls /home); do
+        tomcat_dirs=$(find /home/$user -maxdepth 1 -type d \\( -iname "apache-tomcat*" -o -iname "apache*" \\) 2>/dev/null | xargs -n 1 basename | paste -sd "," -)
+        echo "$user,$tomcat_dirs"
+    done
+    """
 
-command_id = response["Command"]["CommandId"]
+    print(f"\nRunning command on instance {instance['Name']} ({instance_id})...")
 
-# Wait for command result
-import time
-while True:
-    output = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
-    if output["Status"] in ["Success", "Failed", "Cancelled", "TimedOut"]:
-        break
-    time.sleep(2)
+    ssm = boto3.client("ssm")
+    cmd_id = send_ssm_command(instance_id, bash_script)
+    output = get_command_output(ssm, instance_id, cmd_id)
 
-# Step 3: Process and save output
-if output["Status"] == "Success":
+    if output["Status"] != "Success":
+        print("Command failed or timed out.")
+        print("Error:", output.get("StandardErrorContent", "No error message"))
+        return
+
+    # Parse output
     rows = []
     for line in output["StandardOutputContent"].strip().split("\n"):
         if line.strip():
             user, tomcat_dirs = line.split(",", 1)
-            rows.append([selected_instance["name"], user, tomcat_dirs if tomcat_dirs else "-"])
+            if not tomcat_dirs.strip():
+                tomcat_dirs = "-"
+            rows.append([instance["Name"], user, tomcat_dirs])
 
-    # Save to CSV
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"tomcat_users_{timestamp}.csv"
+    # Save CSV locally
+    filename = f"tomcat_directories_{instance['Name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Instance Name", "User", "Apache-Tomcat Directories"])
+        writer.writerow(["Instance Name", "User", "Tomcat Directories"])
         writer.writerows(rows)
 
     # Print table
-    print(tabulate(rows, headers=["Instance Name", "User", "Apache-Tomcat Directories"], tablefmt="grid"))
-    print(f"\nData saved to {filename}")
+    print("\nTomcat Audit Results:")
+    print(tabulate(rows, headers=["Instance Name", "User", "Tomcat Directories"], tablefmt="grid"))
+    print(f"\nData saved to: {filename}")
 
-else:
-    print(f"Command failed: {output['StandardErrorContent']}")
+if __name__ == "__main__":
+    main()
