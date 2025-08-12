@@ -1,111 +1,102 @@
-#!/usr/bin/env python3
 import boto3
 import csv
-import time
-from tabulate import tabulate
+import re
+from datetime import datetime
 
-# Initialize AWS clients
-ssm_client = boto3.client("ssm")
-ec2_client = boto3.client("ec2")
-
-def list_instances():
-    """List running EC2 instances with SSM access."""
-    response = ec2_client.describe_instances(
-        Filters=[
-            {"Name": "instance-state-name", "Values": ["running"]}
-        ]
-    )
+def list_running_instances():
+    ec2 = boto3.client('ec2')
+    reservations = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
     instances = []
-    for reservation in response["Reservations"]:
-        for instance in reservation["Instances"]:
-            instance_id = instance["InstanceId"]
-            name_tag = next(
-                (tag["Value"] for tag in instance.get("Tags", []) if tag["Key"] == "Name"),
-                "NoName"
-            )
-            instances.append({"id": instance_id, "name": name_tag})
+    for res in reservations['Reservations']:
+        for inst in res['Instances']:
+            name = next((t['Value'] for t in inst.get('Tags', []) if t['Key'] == 'Name'), 'Unnamed')
+            instances.append({
+                'id': inst['InstanceId'],
+                'name': name,
+                'type': inst['InstanceType'],
+                'private_ip': inst.get('PrivateIpAddress', 'N/A')
+            })
     return instances
 
 def choose_instance(instances):
-    """Prompt user to choose an instance."""
-    print("\nAvailable Instances:")
-    for idx, inst in enumerate(instances, 1):
-        print(f"{idx}. {inst['name']} ({inst['id']})")
-    choice = int(input("\nSelect an instance number: ")) - 1
+    print("\nAvailable running instances:")
+    for i, inst in enumerate(instances):
+        print(f"{i+1}. {inst['name']} ({inst['id']}) - {inst['type']} - {inst['private_ip']}")
+    choice = int(input("\nSelect instance number: ")) - 1
     return instances[choice]
 
-def fetch_tomcat_info(instance_id):
-    """Fetch Tomcat details using SSM without modifying the instance."""
-    command = r"""
-ps -ef | grep [t]omcat | awk '{print $1, $8}' | while read user proc; do
-    port=$(netstat -tulnp 2>/dev/null | grep java | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | tr '\n' ',')
-    tomcat_dir=$(dirname $(readlink -f $(which $proc)) 2>/dev/null || echo "Unknown")
-    domain=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || echo "Unknown")
-    echo "$user,$port,$tomcat_dir,$domain"
-done
-"""
-    response = ssm_client.send_command(
+def fetch_redirect_ports(instance_id):
+    ssm = boto3.client('ssm')
+    
+    command = (
+        "find /home -type f -path '*/apache-tomcat*/conf/server.xml' -exec "
+        "grep -H 'redirectPort' {} \\; || echo 'No Tomcat found'"
+    )
+    
+    resp = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
         Parameters={"commands": [command]},
     )
-    command_id = response["Command"]["CommandId"]
+    
+    cmd_id = resp['Command']['CommandId']
+    
+    # Wait for output
+    while True:
+        output = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
+        if output['Status'] in ('Success', 'Failed', 'TimedOut', 'Cancelled'):
+            break
+    
+    return output['StandardOutputContent']
 
-    # Wait for command to finish
-    time.sleep(2)
-    output = ssm_client.get_command_invocation(
-        CommandId=command_id, InstanceId=instance_id
-    )
-
-    if output["Status"] != "Success":
-        return []
-
+def parse_redirect_ports(raw_output):
     results = []
-    for line in output["StandardOutputContent"].strip().split("\n"):
-        if line and "," in line:
-            user, port, tomcat_dir, domain = line.split(",", 3)
-            results.append({
-                "Instance ID": instance_id,
-                "Port": port,
-                "User": user,
-                "Tomcat Directory": tomcat_dir,
-                "Domain": domain
-            })
+    for line in raw_output.splitlines():
+        match = re.search(r"(/.*server\.xml).*redirectPort=\"(\d+)\"", line)
+        if match:
+            path, port = match.groups()
+            username = path.split("/")[2]  # e.g., /home/ubuntu/...
+            results.append((username, path, port))
     return results
 
-def save_csv(results, instance_name):
-    """Save results to CSV file."""
-    filename = f"tomcat_audit_{instance_name}.csv"
-    with open(filename, mode="w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
+def save_to_csv(instance_name, results):
+    filename = f"tomcat_redirect_ports_{instance_name.replace(' ', '_')}.csv"
+    with open(filename, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Username", "Tomcat Path", "RedirectPort"])
         writer.writerows(results)
     return filename
 
 def main():
-    while True:
-        instances = list_instances()
-        if not instances:
-            print("No running instances found.")
-            return
-
-        chosen = choose_instance(instances)
-        results = fetch_tomcat_info(chosen["id"])
-
-        if results:
-            # Display table
-            print("\nTomcat Audit Results:")
-            print(tabulate(results, headers="keys", tablefmt="grid"))
-
-            # Save CSV
-            csv_file = save_csv(results, chosen["name"])
-            print(f"\nResults saved to {csv_file}")
-        else:
-            print("No Tomcat processes found on this instance.")
-
-        again = input("\nDo you want to check another instance? (y/n): ").strip().lower()
-        if again != "y":
-            break
+    instances = list_running_instances()
+    if not instances:
+        print("No running instances found.")
+        return
+    
+    instance = choose_instance(instances)
+    print(f"\nFetching Tomcat redirect ports from {instance['name']} ({instance['id']})...")
+    
+    raw_output = fetch_redirect_ports(instance['id'])
+    
+    if "No Tomcat found" in raw_output or not raw_output.strip():
+        print("\nNo Tomcat installations with redirectPort found.")
+        return
+    
+    results = parse_redirect_ports(raw_output)
+    
+    if not results:
+        print("\nNo redirectPort entries found.")
+        return
+    
+    print("\n+----------+----------------------------------------------------+--------------+")
+    print("| Username | Tomcat Path                                        | RedirectPort |")
+    print("+----------+----------------------------------------------------+--------------+")
+    for row in results:
+        print(f"| {row[0]:<8} | {row[1]:<50} | {row[2]:<12} |")
+    print("+----------+----------------------------------------------------+--------------+")
+    
+    csv_file = save_to_csv(instance['name'], results)
+    print(f"\nSaved to: {csv_file}")
 
 if __name__ == "__main__":
     main()
