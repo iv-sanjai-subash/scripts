@@ -1,94 +1,85 @@
 import boto3
 import time
-import json
+import csv
+from datetime import datetime
 
-# AWS clients
-ec2 = boto3.client('ec2')
 ssm = boto3.client('ssm')
+ec2 = boto3.client('ec2')
 
 def list_instances():
-    """List all running instances with SSM managed status."""
+    """List running EC2 instances that have SSM agent enabled."""
     instances = []
     paginator = ec2.get_paginator('describe_instances')
-    for page in paginator.paginate(
-        Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
-    ):
+    for page in paginator.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
         for reservation in page['Reservations']:
             for instance in reservation['Instances']:
                 instance_id = instance['InstanceId']
-                name = next(
-                    (tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'),
-                    ''
-                )
-                # Check if SSM managed
-                ssm_status = 'No'
-                try:
-                    ssm_desc = ssm.describe_instance_information(
-                        Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
-                    )
-                    if ssm_desc['InstanceInformationList']:
-                        ssm_status = 'Yes'
-                except:
-                    pass
-                instances.append({'id': instance_id, 'name': name, 'ssm': ssm_status})
+                name = next((t['Value'] for t in instance.get('Tags', []) if t['Key'] == 'Name'), '')
+                instances.append({'id': instance_id, 'name': name})
     return instances
 
 def fetch_redirect_ports(instance_id):
-    """Fetch Tomcat redirect ports from the instance using SSM."""
+    """Run SSM command to fetch Tomcat redirect ports from server.xml."""
     print(f"\nFetching Tomcat redirect ports from {instance_id}...")
-    command = (
-        "grep 'redirectPort' /opt/tomcat*/conf/server.xml 2>/dev/null | "
-        "sed -n 's/.*redirectPort=\"\\([0-9]\\+\\)\".*/\\1/p' | sort -u"
-    )
+
+    # Command to search for redirectPort in Tomcat config
+    command = "grep -R 'redirectPort' /opt/tomcat*/conf/server.xml 2>/dev/null || echo 'No redirectPort found'"
+
+    # Send SSM command
     response = ssm.send_command(
         InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Parameters={"commands": [command]},
+        DocumentName='AWS-RunShellScript',
+        Parameters={'commands': [command]},
     )
-    cmd_id = response['Command']['CommandId']
 
-    # Wait for execution to complete
+    command_id = response['Command']['CommandId']
+
+    # Poll for status
     while True:
-        invocation = ssm.get_command_invocation(
-            CommandId=cmd_id,
-            InstanceId=instance_id
-        )
-        if invocation['Status'] in ('Success', 'Failed', 'Cancelled', 'TimedOut'):
+        invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+        status = invocation['Status']
+        if status in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
             break
         time.sleep(2)
 
-    if invocation['Status'] == 'Success':
-        output = invocation.get('StandardOutputContent', '').strip()
-        if output:
-            print(f"\nRedirect ports found:\n{output}\n")
-        else:
-            print("\nNo redirect ports found.\n")
-    else:
-        print(f"\nCommand failed with status: {invocation['Status']}\n")
+    # Display output
+    output = invocation['StandardOutputContent'].strip()
+    if not output:
+        output = "No redirectPort found"
+    print(f"Redirect Port(s):\n{output}\n")
+    return output
 
 def main():
-    while True:
-        instances = list_instances()
-        ssm_instances = [i for i in instances if i['ssm'] == 'Yes']
+    instances = list_instances()
+    if not instances:
+        print("No running instances found.")
+        return
 
-        if not ssm_instances:
-            print("No SSM-managed running instances found.")
-            return
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    csv_file = f"tomcat_redirect_ports_{timestamp}.csv"
 
-        print("\nAvailable instances:")
-        for idx, inst in enumerate(ssm_instances, start=1):
-            print(f"{idx}. {inst['name']} ({inst['id']})")
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Instance Name", "Instance ID", "Redirect Ports"])
 
-        choice = input("\nSelect instance number (or 'q' to quit): ").strip()
-        if choice.lower() == 'q':
-            break
+        for idx, instance in enumerate(instances, 1):
+            print(f"[{idx}] {instance['name']} ({instance['id']})")
 
-        if not choice.isdigit() or int(choice) not in range(1, len(ssm_instances)+1):
-            print("Invalid choice. Try again.")
-            continue
+        while True:
+            try:
+                choice = int(input("\nSelect an instance number (0 to exit): "))
+                if choice == 0:
+                    break
+                if 1 <= choice <= len(instances):
+                    selected = instances[choice - 1]
+                    ports = fetch_redirect_ports(selected['id'])
+                    writer.writerow([selected['name'], selected['id'], ports])
+                else:
+                    print("Invalid choice.")
+            except ValueError:
+                print("Please enter a valid number.")
 
-        instance = ssm_instances[int(choice)-1]
-        fetch_redirect_ports(instance['id'])
+    print(f"\nReport saved as {csv_file}")
 
 if __name__ == "__main__":
     main()
