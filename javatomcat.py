@@ -1,127 +1,101 @@
 import boto3
 import csv
 import time
-from datetime import datetime
+from tabulate import tabulate
 
-# AWS Clients
-ec2 = boto3.client('ec2')
-ssm = boto3.client('ssm')
+# AWS clients
+ec2_client = boto3.client('ec2')
+ssm_client = boto3.client('ssm')
 
-# Get list of running EC2 instances
+# Step 1: List all instances
 def list_instances():
-    instances_info = []
-    reservations = ec2.describe_instances(Filters=[
-        {'Name': 'instance-state-name', 'Values': ['running']}
-    ])['Reservations']
-
-    for r in reservations:
-        for i in r['Instances']:
-            name = next((t['Value'] for t in i.get('Tags', []) if t['Key'] == 'Name'), 'N/A')
-            instances_info.append({
-                'id': i['InstanceId'],
-                'name': name,
-                'type': i['InstanceType'],
-                'private_ip': i.get('PrivateIpAddress', 'N/A'),
-                'os': detect_os(i)
+    instances = []
+    reservations = ec2_client.describe_instances()['Reservations']
+    for res in reservations:
+        for inst in res['Instances']:
+            name = ""
+            for tag in inst.get('Tags', []):
+                if tag['Key'] == 'Name':
+                    name = tag['Value']
+            instances.append({
+                'InstanceId': inst['InstanceId'],
+                'Name': name,
+                'State': inst['State']['Name']
             })
-    return instances_info
+    return instances
 
-# Detect OS from PlatformDetails
-def detect_os(instance):
-    platform = instance.get('PlatformDetails', '').lower()
-    if 'windows' in platform:
-        return 'Windows'
-    return 'Linux'
+# Step 2: Let user choose an instance
+def choose_instance(instances):
+    print("\nAvailable Instances:")
+    for i, inst in enumerate(instances):
+        print(f"{i+1}. {inst['Name']} ({inst['InstanceId']}) - {inst['State']}")
+    choice = int(input("\nEnter the number of the instance: ")) - 1
+    return instances[choice]['InstanceId'], instances[choice]['Name']
 
-# Fetch Tomcat redirect ports via SSM (read-only)
-def fetch_redirect_ports(instance_id, os_type):
-    if os_type == 'Windows':
-        command = 'Select-String -Path "C:\\Program Files\\Apache Software Foundation\\Tomcat*\\conf\\server.xml" -Pattern "redirectPort"'
-    else:
-        command = "grep -R 'redirectPort' /opt/tomcat*/conf/server.xml || grep -R 'redirectPort' /usr/share/tomcat*/conf/server.xml"
-
-    response = ssm.send_command(
+# Step 3: Fetch Tomcat directories
+def fetch_tomcat_info(instance_id):
+    command = """
+    echo "Instance Name: $(hostname)";
+    echo "Users:";
+    ls /home;
+    echo "Tomcat Directories:";
+    find /home -type d -name "tomcat*" 2>/dev/null
+    """
+    response = ssm_client.send_command(
         InstanceIds=[instance_id],
-        DocumentName='AWS-RunShellScript' if os_type == 'Linux' else 'AWS-RunPowerShellScript',
-        Parameters={'commands': [command]},
+        DocumentName="AWS-RunShellScript",
+        Parameters={'commands': [command]}
     )
-
     command_id = response['Command']['CommandId']
+    time.sleep(2)
+    output = ssm_client.get_command_invocation(
+        CommandId=command_id,
+        InstanceId=instance_id
+    )
+    return output['StandardOutputContent']
 
-    # Wait until command completes
-    for _ in range(30):
-        time.sleep(2)
-        try:
-            invocation = ssm.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=instance_id
-            )
-        except ssm.exceptions.InvocationDoesNotExist:
-            continue  # Command not yet registered
+# Step 4: Parse and save CSV
+def save_to_csv(instance_name, instance_id, output):
+    users_section = []
+    tomcat_dirs = []
+    lines = output.strip().split("\n")
 
-        if invocation['Status'] in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
-            output = invocation.get('StandardOutputContent', '').strip()
-            return parse_redirect_ports(output)
+    try:
+        users_start = lines.index("Users:") + 1
+        tomcat_start = lines.index("Tomcat Directories:") + 1
+        users_section = lines[users_start:tomcat_start - 1]
+        tomcat_dirs = lines[tomcat_start:]
+    except ValueError:
+        pass
 
-    return ["No ports found"]
+    csv_file = "tomcat_audit.csv"
+    with open(csv_file, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Instance Name", "Instance ID", "User", "Tomcat Directory"])
+        for user in users_section:
+            for tomcat in tomcat_dirs:
+                if f"/home/{user}" in tomcat:
+                    writer.writerow([instance_name, instance_id, user, tomcat])
 
-# Extract only redirect ports from output
-def parse_redirect_ports(output):
-    ports = []
-    for line in output.splitlines():
-        if 'redirectPort' in line:
-            import re
-            matches = re.findall(r'redirectPort\s*=\s*"(\d+)"', line)
-            ports.extend(matches)
-    return ports if ports else ["Not Found"]
+    print("\nCSV file saved:", csv_file)
+    return csv_file
 
-# Save results to CSV
-def save_to_csv(results):
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"tomcat_redirect_ports_{timestamp}.csv"
-    with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['Instance ID', 'Name', 'Private IP', 'OS', 'Redirect Ports']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            writer.writerow(r)
-    print(f"\n✅ CSV saved: {filename}")
+# Step 5: Print CSV as table
+def print_csv_as_table(csv_file):
+    with open(csv_file, newline="") as f:
+        reader = csv.reader(f)
+        data = list(reader)
+        print("\nTomcat Audit Results:")
+        print(tabulate(data[1:], headers=data[0], tablefmt="grid"))
 
-# Main flow
-def main():
+# Main execution
+if __name__ == "__main__":
     instances = list_instances()
     if not instances:
-        print("No running instances found.")
-        return
-
-    # Display instances
-    print("\nAvailable EC2 Instances:")
-    for idx, inst in enumerate(instances, start=1):
-        print(f"{idx}. {inst['name']} ({inst['id']}) - {inst['private_ip']} - {inst['os']}")
-
-    while True:
-        try:
-            choice = int(input("\nSelect an instance number (0 to exit): "))
-            if choice == 0:
-                break
-            if 1 <= choice <= len(instances):
-                selected = instances[choice - 1]
-                print(f"\nFetching Tomcat redirect ports from {selected['id']}...")
-                ports = fetch_redirect_ports(selected['id'], selected['os'])
-
-                print(f"➡ Redirect Ports for {selected['name']} ({selected['id']}): {', '.join(ports)}")
-
-                save_to_csv([{
-                    'Instance ID': selected['id'],
-                    'Name': selected['name'],
-                    'Private IP': selected['private_ip'],
-                    'OS': selected['os'],
-                    'Redirect Ports': ', '.join(ports)
-                }])
-            else:
-                print("Invalid choice.")
-        except ValueError:
-            print("Please enter a valid number.")
-
-if __name__ == "__main__":
-    main()
+        print("No instances found.")
+    else:
+        instance_id, instance_name = choose_instance(instances)
+        print(f"\nFetching Tomcat info for {instance_name} ({instance_id})...")
+        output = fetch_tomcat_info(instance_id)
+        csv_file = save_to_csv(instance_name, instance_id, output)
+        print_csv_as_table(csv_file)
