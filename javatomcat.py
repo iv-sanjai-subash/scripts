@@ -1,70 +1,95 @@
 import boto3
-import csv
 import subprocess
-from tabulate import tabulate
+import csv
+from prettytable import PrettyTable
+from datetime import datetime
 
+# AWS EC2 client
+ec2 = boto3.client('ec2')
+
+# Get list of EC2 instances
 def list_instances():
-    ec2 = boto3.client('ec2')
     instances = []
-    reservations = ec2.describe_instances()['Reservations']
-    for r in reservations:
-        for i in r['Instances']:
-            name = ''
-            for tag in i.get('Tags', []):
+    response = ec2.describe_instances()
+    for reservation in response['Reservations']:
+        for instance in reservation['Instances']:
+            name = ""
+            for tag in instance.get('Tags', []):
                 if tag['Key'] == 'Name':
                     name = tag['Value']
             instances.append({
-                'InstanceId': i['InstanceId'],
-                'Name': name,
-                'State': i['State']['Name']
+                'InstanceId': instance['InstanceId'],
+                'Name': name if name else "No Name",
+                'State': instance['State']['Name'],
+                'PrivateIp': instance.get('PrivateIpAddress', 'N/A'),
+                'PublicIp': instance.get('PublicIpAddress', 'N/A')
             })
     return instances
 
-def fetch_tomcat_details(instance_id):
-    ssm = boto3.client('ssm')
-    command = """
-    for userdir in /home/*; do
-        if [ -d "$userdir" ]; then
-            username=$(basename "$userdir")
-            tomcats=$(find "$userdir" -maxdepth 1 -type d \\( -name "apache-tomcat*" -o -name "apache*" \\) 2>/dev/null | xargs -n 1 basename)
-            if [ -n "$tomcats" ]; then
-                echo "$username|$tomcats"
-            fi
+# Let user choose instance by index
+def choose_instance(instances):
+    print("\nAvailable Instances:")
+    for idx, inst in enumerate(instances):
+        print(f"[{idx}] {inst['Name']} ({inst['InstanceId']}) - State: {inst['State']} - Public IP: {inst['PublicIp']}")
+    choice = int(input("\nSelect instance index: "))
+    return instances[choice]
+
+# Fetch users and apache-tomcat directories
+def fetch_details(instance):
+    public_ip = instance['PublicIp']
+    if public_ip == 'N/A':
+        print("No public IP. Cannot SSH.")
+        return []
+
+    # Command to list home dirs and apache dirs
+    bash_command = r"""
+    for user in $(ls /home); do
+        dirs=$(find /home/$user -maxdepth 1 -type d \( -name "apache-tomcat*" -o -name "apache*" \) -printf "%f\n" 2>/dev/null)
+        if [ -n "$dirs" ]; then
+            echo "$user,$dirs"
         fi
     done
     """
-    response = ssm.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Parameters={'commands': [command]}
-    )
-    command_id = response['Command']['CommandId']
-    output = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
-    return output['StandardOutputContent']
 
-def main():
-    instances = list_instances()
-    print(tabulate(instances, headers="keys"))
+    # Run command via SSH
+    ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{public_ip}", bash_command]
+    try:
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+        if result.stdout.strip():
+            rows = []
+            for line in result.stdout.strip().split("\n"):
+                user, dirs = line.split(",", 1)
+                rows.append([instance['Name'], user, dirs])
+            return rows
+        else:
+            return []
+    except Exception as e:
+        print(f"Error: {e}")
+        return []
 
-    choice = int(input("\nSelect instance index: "))
-    instance_id = instances[choice]['InstanceId']
-    instance_name = instances[choice]['Name']
-
-    details = fetch_tomcat_details(instance_id)
-    rows = []
-    for line in details.strip().split("\n"):
-        if "|" in line:
-            user, dirs = line.split("|", 1)
-            rows.append([instance_name, user, dirs])
-
-    # Save to CSV
-    with open('tomcat_directories.csv', 'w', newline='') as f:
+# Save CSV and print table
+def save_and_print(data):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"tomcat_directories_{timestamp}.csv"
+    with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(['Instance Name', 'User', 'Tomcat Directories'])
-        writer.writerows(rows)
+        writer.writerow(["Instance Name", "User", "Tomcat Directories"])
+        writer.writerows(data)
+    print(f"\nSaved results to {filename}")
 
-    print("\nFound Tomcat Directories:")
-    print(tabulate(rows, headers=['Instance Name', 'User', 'Tomcat Directories']))
+    table = PrettyTable(["Instance Name", "User", "Tomcat Directories"])
+    for row in data:
+        table.add_row(row)
+    print("\n" + table.get_string())
 
 if __name__ == "__main__":
-    main()
+    instances = list_instances()
+    if not instances:
+        print("No instances found.")
+    else:
+        selected_instance = choose_instance(instances)
+        details = fetch_details(selected_instance)
+        if details:
+            save_and_print(details)
+        else:
+            print("No apache-tomcat directories found.")
