@@ -1,6 +1,5 @@
 #!/bin/bash
-# Read-only script to check prefix list IDs across all regions
-# Outputs a table if found, or "Not found" if missing
+# Read-only script: only shows prefix lists visible in AWS Console
 
 INPUT_FILE="prefix_ids.txt"
 
@@ -11,9 +10,7 @@ while IFS= read -r PLID || [ -n "$PLID" ]; do
   for region in $(aws ec2 describe-regions --query "Regions[].RegionName" --output text); do
     output=$(aws ec2 describe-managed-prefix-lists \
       --region "$region" \
-      --prefix-list-ids "$PLID" \
-      --query "PrefixLists[].{Region:'$region',ID:PrefixListId,Name:PrefixListName,Owner:OwnerId}" \
-      --output table 2>/dev/null)
+      --output table 2>/dev/null | grep "$PLID")
 
     if [ -n "$output" ]; then
       echo "$output"
